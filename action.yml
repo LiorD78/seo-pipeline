@@ -1,9 +1,12 @@
 name: 'SEO Pipeline'
 description: >
-  Reusable composite action for static-site SEO automation.
+  Reusable composite action for SEO automation.
   Pings IndexNow (Bing/Yandex/Seznam), refreshes Facebook Open Graph cache,
   and optionally submits sitemap to Google Search Console.
-  Designed to run after a successful deploy step.
+  Supports two modes:
+    - deploy-driven (default): provide explicit url-list (e.g. after a deploy)
+    - sitemap-driven: fetch sitemap.xml, diff against stored state, ping
+      only new/changed URLs (great for hosted platforms like BSSHOP, Shoptet)
 author: 'LiorD78'
 branding:
   icon: 'search'
@@ -14,9 +17,40 @@ inputs:
   host:
     description: 'Domain host without protocol, e.g. www.example.com'
     required: true
+
+  # ─────────── MODE ───────────
+  mode:
+    description: '"deploy-driven" (default, uses url-list) or "sitemap-driven" (uses sitemap-url + state-file)'
+    required: false
+    default: 'deploy-driven'
+
+  # ─────────── DEPLOY-DRIVEN MODE ───────────
   url-list:
-    description: 'Newline-separated list of full URLs to ping (no quotes, no commas).'
-    required: true
+    description: 'Newline-separated list of full URLs to ping (deploy-driven mode).'
+    required: false
+    default: ''
+
+  # ─────────── SITEMAP-DRIVEN MODE ───────────
+  sitemap-url:
+    description: 'Full URL of sitemap.xml (or sitemap index). Required for sitemap-driven mode.'
+    required: false
+    default: ''
+  state-file:
+    description: 'Path to JSON file with previous sitemap snapshot. Created on first run.'
+    required: false
+    default: '.seo-state/sitemap-state.json'
+  max-urls:
+    description: 'Cap the URL list per run (default 10000).'
+    required: false
+    default: '10000'
+  first-run-limit:
+    description: 'On first run only (no state), cap URLs to this number to avoid pinging the entire site at once (default 100).'
+    required: false
+    default: '100'
+  commit-state:
+    description: 'If true, automatically commit & push the updated state-file back to the repo (default true).'
+    required: false
+    default: 'true'
 
   # ─────────── INDEXNOW ───────────
   indexnow-key:
@@ -34,11 +68,7 @@ inputs:
     required: false
     default: ''
 
-  # ─────────── SITEMAP ───────────
-  sitemap-url:
-    description: 'Full URL of sitemap.xml (e.g. https://www.example.com/sitemap.xml). Skip step if empty.'
-    required: false
-    default: ''
+  # ─────────── GOOGLE SITEMAP PING ───────────
   ping-google-sitemap:
     description: 'Whether to ping Google with sitemap URL (legacy /ping endpoint, best-effort).'
     required: false
@@ -50,40 +80,146 @@ inputs:
     required: false
     default: 'false'
 
+outputs:
+  changed-count:
+    description: 'Number of URLs detected as new or changed (sitemap-driven mode only).'
+    value: ${{ steps.sitemap-diff.outputs.changed-count }}
+  emitted-count:
+    description: 'Number of URLs actually pinged (after caps, sitemap-driven mode only).'
+    value: ${{ steps.sitemap-diff.outputs.emitted-count }}
+  total-count:
+    description: 'Total URLs in sitemap (sitemap-driven mode only).'
+    value: ${{ steps.sitemap-diff.outputs.total-count }}
+
 runs:
   using: 'composite'
   steps:
+    # ─────── Validate inputs based on mode ──────────────────────────────────
+    - name: '🔧 Validate inputs'
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        URL_LIST: ${{ inputs.url-list }}
+        SITEMAP_URL: ${{ inputs.sitemap-url }}
+      run: |
+        if [ "$MODE" = "sitemap-driven" ]; then
+          if [ -z "$SITEMAP_URL" ]; then
+            echo "❌ mode=sitemap-driven requires sitemap-url"; exit 1
+          fi
+        elif [ "$MODE" = "deploy-driven" ]; then
+          if [ -z "$URL_LIST" ]; then
+            echo "❌ mode=deploy-driven requires url-list"; exit 1
+          fi
+        else
+          echo "❌ Unknown mode: $MODE (use 'deploy-driven' or 'sitemap-driven')"
+          exit 1
+        fi
+        echo "✅ Mode: $MODE"
+
+    # ─────── Sitemap-driven: compute diff, populate URL_LIST ────────────────
+    - name: '🗺️  Sitemap diff'
+      id: sitemap-diff
+      if: inputs.mode == 'sitemap-driven'
+      shell: bash
+      env:
+        SITEMAP_URL: ${{ inputs.sitemap-url }}
+        STATE_FILE: ${{ inputs.state-file }}
+        OUT_URL_LIST_FILE: ${{ runner.temp }}/seo-pipeline-urls.txt
+        MAX_URLS: ${{ inputs.max-urls }}
+        FIRST_RUN_LIMIT: ${{ inputs.first-run-limit }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: |
+        # Ensure state-file directory exists
+        mkdir -p "$(dirname "$STATE_FILE")"
+        bash ${{ github.action_path }}/scripts/sitemap-diff.sh
+
+    # ─────── Combine URL_LIST source: explicit input OR sitemap diff ────────
+    - name: '📋 Resolve URL list'
+      id: resolve-urls
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        EXPLICIT_URL_LIST: ${{ inputs.url-list }}
+        SITEMAP_URL_LIST_FILE: ${{ runner.temp }}/seo-pipeline-urls.txt
+      run: |
+        OUT="${{ runner.temp }}/seo-pipeline-final-urls.txt"
+        if [ "$MODE" = "sitemap-driven" ]; then
+          if [ -f "$SITEMAP_URL_LIST_FILE" ]; then
+            cp "$SITEMAP_URL_LIST_FILE" "$OUT"
+          else
+            : > "$OUT"
+          fi
+        else
+          printf '%s\n' "$EXPLICIT_URL_LIST" > "$OUT"
+        fi
+        COUNT=$(grep -cv '^[[:space:]]*$' "$OUT" || true)
+        echo "📋 Final URL count: $COUNT"
+        echo "url-list-file=$OUT" >> "$GITHUB_OUTPUT"
+        echo "url-count=$COUNT" >> "$GITHUB_OUTPUT"
+
+    # ─────── IndexNow ──────────────────────────────────────────────────────
     - name: '🔔 IndexNow ping (Bing / Yandex / Seznam)'
-      if: inputs.indexnow-key != ''
+      if: inputs.indexnow-key != '' && steps.resolve-urls.outputs.url-count != '0'
       shell: bash
       env:
         HOST: ${{ inputs.host }}
         KEY: ${{ inputs.indexnow-key }}
         KEY_LOC: ${{ inputs.indexnow-key-location }}
-        URL_LIST: ${{ inputs.url-list }}
+        URL_LIST_FILE: ${{ steps.resolve-urls.outputs.url-list-file }}
         FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
-      run: ${{ github.action_path }}/scripts/indexnow.sh
+      run: |
+        # Backward compat: scripts read URL_LIST from env (string).
+        export URL_LIST="$(cat "$URL_LIST_FILE")"
+        bash ${{ github.action_path }}/scripts/indexnow.sh
 
+    # ─────── Facebook ──────────────────────────────────────────────────────
     - name: '📘 Facebook Open Graph cache refresh'
-      if: inputs.fb-access-token != ''
+      if: inputs.fb-access-token != '' && steps.resolve-urls.outputs.url-count != '0'
       shell: bash
       env:
         FB_TOKEN: ${{ inputs.fb-access-token }}
-        URL_LIST: ${{ inputs.url-list }}
+        URL_LIST_FILE: ${{ steps.resolve-urls.outputs.url-list-file }}
         FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
-      run: ${{ github.action_path }}/scripts/fb-refresh.sh
+      run: |
+        export URL_LIST="$(cat "$URL_LIST_FILE")"
+        bash ${{ github.action_path }}/scripts/fb-refresh.sh
 
-    - name: '🗺️  Sitemap ping (Google legacy)'
+    # ─────── Google sitemap ping (legacy) ──────────────────────────────────
+    - name: '🌐 Sitemap ping (Google legacy)'
       if: inputs.sitemap-url != '' && inputs.ping-google-sitemap == 'true'
       shell: bash
       env:
         SITEMAP_URL: ${{ inputs.sitemap-url }}
         FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
-      run: ${{ github.action_path }}/scripts/sitemap-ping.sh
+      run: bash ${{ github.action_path }}/scripts/sitemap-ping.sh
 
+    # ─────── Commit updated state-file back to repo ────────────────────────
+    - name: '💾 Commit state file'
+      if: inputs.mode == 'sitemap-driven' && inputs.commit-state == 'true'
+      shell: bash
+      env:
+        STATE_FILE: ${{ inputs.state-file }}
+      run: |
+        if [ ! -f "$STATE_FILE" ]; then
+          echo "ℹ️  No state file to commit"
+          exit 0
+        fi
+        git config user.name 'github-actions[bot]'
+        git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        git add "$STATE_FILE"
+        if git diff --cached --quiet; then
+          echo "ℹ️  State file unchanged — nothing to commit"
+          exit 0
+        fi
+        git commit -m "chore: update sitemap state [skip ci]"
+        git push
+        echo "✅ State file committed"
+
+    # ─────── Summary ───────────────────────────────────────────────────────
     - name: '✅ SEO pipeline summary'
       shell: bash
       run: |
         echo "════════════════════════════════════════"
         echo "  SEO pipeline finished for ${{ inputs.host }}"
+        echo "  Mode: ${{ inputs.mode }}"
         echo "════════════════════════════════════════"
