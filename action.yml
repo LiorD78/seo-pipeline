@@ -1,0 +1,89 @@
+name: 'SEO Pipeline'
+description: >
+  Reusable composite action for static-site SEO automation.
+  Pings IndexNow (Bing/Yandex/Seznam), refreshes Facebook Open Graph cache,
+  and optionally submits sitemap to Google Search Console.
+  Designed to run after a successful deploy step.
+author: 'LiorD78'
+branding:
+  icon: 'search'
+  color: 'green'
+
+inputs:
+  # ─────────── REQUIRED ───────────
+  host:
+    description: 'Domain host without protocol, e.g. www.example.com'
+    required: true
+  url-list:
+    description: 'Newline-separated list of full URLs to ping (no quotes, no commas).'
+    required: true
+
+  # ─────────── INDEXNOW ───────────
+  indexnow-key:
+    description: 'IndexNow API key (32 hex chars). Skip step if empty.'
+    required: false
+    default: ''
+  indexnow-key-location:
+    description: 'Public URL of the verification key file. Defaults to https://{host}/{key}.txt'
+    required: false
+    default: ''
+
+  # ─────────── FACEBOOK ───────────
+  fb-access-token:
+    description: 'Facebook App Access Token in format {AppID}|{AppSecret}. Skip step if empty.'
+    required: false
+    default: ''
+
+  # ─────────── SITEMAP ───────────
+  sitemap-url:
+    description: 'Full URL of sitemap.xml (e.g. https://www.example.com/sitemap.xml). Skip step if empty.'
+    required: false
+    default: ''
+  ping-google-sitemap:
+    description: 'Whether to ping Google with sitemap URL (legacy /ping endpoint, best-effort).'
+    required: false
+    default: 'false'
+
+  # ─────────── BEHAVIOR ───────────
+  fail-on-error:
+    description: 'If true, the action fails when any sub-step errors. Default false (best-effort).'
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: '🔔 IndexNow ping (Bing / Yandex / Seznam)'
+      if: inputs.indexnow-key != ''
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        KEY: ${{ inputs.indexnow-key }}
+        KEY_LOC: ${{ inputs.indexnow-key-location }}
+        URL_LIST: ${{ inputs.url-list }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: ${{ github.action_path }}/scripts/indexnow.sh
+
+    - name: '📘 Facebook Open Graph cache refresh'
+      if: inputs.fb-access-token != ''
+      shell: bash
+      env:
+        FB_TOKEN: ${{ inputs.fb-access-token }}
+        URL_LIST: ${{ inputs.url-list }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: ${{ github.action_path }}/scripts/fb-refresh.sh
+
+    - name: '🗺️  Sitemap ping (Google legacy)'
+      if: inputs.sitemap-url != '' && inputs.ping-google-sitemap == 'true'
+      shell: bash
+      env:
+        SITEMAP_URL: ${{ inputs.sitemap-url }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: ${{ github.action_path }}/scripts/sitemap-ping.sh
+
+    - name: '✅ SEO pipeline summary'
+      shell: bash
+      run: |
+        echo "════════════════════════════════════════"
+        echo "  SEO pipeline finished for ${{ inputs.host }}"
+        echo "════════════════════════════════════════"
